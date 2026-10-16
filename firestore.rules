@@ -1,0 +1,136 @@
+rules_version = '2';
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║         HSEPro — Firestore Security Rules                   ║
+// ║  الأدوار: roleAdmin · rolePM · roleSafety · roleSupervisor  ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── helpers ────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin()      { return isSignedIn() && myRole() == 'roleAdmin'; }
+    function isPM()         { return isSignedIn() && (myRole() == 'rolePM'  || isAdmin()); }
+    function isSafety()     { return isSignedIn() && (myRole() == 'roleSafety' || isPM()); }
+    function isSupervisor() { return isSignedIn() && (myRole() == 'roleSupervisor' || isSafety()); }
+    function isAnyRole()    { return isSignedIn() && myRole() in ['roleAdmin','rolePM','roleSafety','roleSupervisor','roleWorker','roleStructural','roleElectrician']; }
+
+    function isOwner(uid)   { return isSignedIn() && request.auth.uid == uid; }
+
+    // يتحقق إن البيانات القادمة لا تحتوي على حقول ممنوع تعديلها
+    function doesNotChange(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // ── users ───────────────────────────────────────────────────
+    // كل مستخدم يقرأ ملفه فقط — الأدمن يقرأ الكل
+    // لا أحد يغيّر دوره بنفسه إلا الأدمن
+    match /users/{userId} {
+      allow read:   if isAnyRole();
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasAll(['name','email','role','uid'])
+                    && request.resource.data.role in ['roleAdmin','rolePM','roleSafety','roleSupervisor','roleWorker','roleStructural','roleElectrician'];
+      allow update: if (isOwner(userId) && doesNotChange(['role','uid']))
+                    || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ── permits ─────────────────────────────────────────────────
+    // القراءة: كل الأدوار
+    // الإنشاء: السلامة والأدمن والـ PM
+    // التعديل: السلامة (حالة Workflow) + PM (اعتماد/رفض)
+    // الحذف: الأدمن فقط
+    match /permits/{permitId} {
+      allow read:   if isAnyRole();
+      allow create: if isSafety()
+                    && request.resource.data.keys().hasAll(['type','location','workDescription','createdBy'])
+                    && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isSafety()   // تحديث Workflow
+                    || isPM();      // اعتماد/رفض/إضافة ملاحظة
+      allow delete: if isAdmin();
+    }
+
+    // ── reports ─────────────────────────────────────────────────
+    // القراءة: كل الأدوار
+    // الإنشاء: أي مستخدم مسجل (يشمل المشرف)
+    // التعديل: السلامة (pmNote) + PM (إغلاق)
+    // الحذف: الأدمن فقط
+    match /reports/{reportId} {
+      allow read:   if isAnyRole();
+      allow create: if isAnyRole()
+                    && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isSafety() || isPM();
+      allow delete: if isAdmin();
+    }
+
+    // ── correctiveActions ────────────────────────────────────────
+    // إنشاء + تعديل: السلامة والـ PM
+    // قراءة: كل الأدوار
+    match /correctiveActions/{actionId} {
+      allow read:   if isAnyRole();
+      allow create: if isSafety()
+                    && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isSafety() || isPM();
+      allow delete: if isAdmin();
+    }
+
+    // ── requests (طلبات تصاريح) ──────────────────────────────────
+    // أي مستخدم ينشئ طلب — السلامة والـ PM يردّان
+    match /requests/{reqId} {
+      allow read:   if isAnyRole();
+      allow create: if isAnyRole()
+                    && request.resource.data.keys().hasAll(['text','sender']);
+      allow update: if isSafety() || isPM();  // رد فقط
+      allow delete: if isAdmin();
+    }
+
+    // ── equipments ──────────────────────────────────────────────
+    // إضافة/تعديل: السلامة والـ PM
+    // قراءة: كل الأدوار
+    match /equipments/{eqId} {
+      allow read:   if isAnyRole();
+      allow create: if isSafety();
+      allow update: if isSafety() || isPM();
+      allow delete: if isAdmin();
+    }
+
+    // ── notifications ────────────────────────────────────────────
+    // كل مستخدم يقرأ إشعاراته فقط — الكتابة للسيرفر فقط (Cloud Functions)
+    // أو أي مستخدم مسجل (في حالة عدم استخدام Functions حالياً)
+    match /notifications/{notifId} {
+      allow read:   if isAnyRole();
+      allow create: if isAnyRole();
+      allow update: if isAnyRole();
+      allow delete: if isAdmin();
+    }
+
+    // ── auditLog (جديد — سجل المراجعة) ──────────────────────────
+    // الكتابة فقط — لا حذف ولا تعديل أبداً (immutable)
+    match /auditLog/{logId} {
+      allow read:   if isPM();
+      allow create: if isAnyRole()
+                    && request.resource.data.keys().hasAll(['action','userId','timestamp','collection','docId']);
+      allow update: if false;  // ممنوع تعديل سجل المراجعة
+      allow delete: if false;  // ممنوع حذف سجل المراجعة
+    }
+
+    // ── kpiSnapshots (لقطات KPIs الشهرية) ───────────────────────
+    match /kpiSnapshots/{snapshotId} {
+      allow read:   if isAnyRole();
+      allow write:  if isPM();
+    }
+
+    // ── منع أي وصول غير مصرح به لأي collection أخرى ────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
